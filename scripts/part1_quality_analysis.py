@@ -4,9 +4,11 @@ Build Part 1 qualitative/code-quality datasets for the PostHog Engineering
 Impact Dashboard.
 
 The repository snapshot for this assessment does not include the existing
-dashboard/pipeline artifacts, so this script reconstructs the "current top"
-impact cohort from GitHub merged PR metadata and then adds the qualitative
-rubric layer requested in PART 1.
+dashboard/pipeline artifacts, so this script reconstructs the impact cohort
+from GitHub merged PR metadata and then adds the qualitative rubric layer
+requested in PART 1. It covers every non-bot contributor in the cohort with
+tiered representative PR depth: deeper review for leaders, lighter-but-cited
+review for long-tail contributors.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ import requests
 
 REPO = "PostHog/posthog"
 OWNER, NAME = REPO.split("/")
-START_DATE = dt.date(2026, 5, 24)
+START_DATE = dt.date(2026, 1, 1)
 END_DATE = dt.date(2026, 6, 23)
 NOW = dt.datetime(2026, 6, 23, 23, 59, tzinfo=dt.timezone.utc)
 
@@ -52,6 +54,9 @@ BOT_LOGINS = {
 TOP_N_CONTRIBUTORS = 10
 DEEP_REVIEW_COUNT = 8
 STANDARD_REVIEW_COUNT = 5
+NEXT_TIER_REVIEW_COUNT = 4
+MID_TIER_REVIEW_COUNT = 2
+LONG_TAIL_REVIEW_COUNT = 1
 
 
 def ensure_dirs() -> None:
@@ -132,7 +137,7 @@ def cache_json(path: Path, fetcher) -> Any:
 
 
 def fetch_recent_merged_prs(client: GitHubClient) -> list[dict[str, Any]]:
-    cache_path = CACHE_DIR / "recent_merged_prs_search_30d.json"
+    cache_path = CACHE_DIR / f"merged_prs_search_{START_DATE.isoformat()}_{END_DATE.isoformat()}.json"
     if cache_path.exists():
         return json.loads(cache_path.read_text())
 
@@ -328,7 +333,33 @@ def select_top_contributors(prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "recent_merged_pr_count": len(author_prs),
             }
         )
-    return sorted(ranked, key=lambda row: row["provisional_impact_total"], reverse=True)[:TOP_N_CONTRIBUTORS]
+    return sorted(ranked, key=lambda row: row["provisional_impact_total"], reverse=True)
+
+
+def coverage_tier_for_rank(rank: int) -> str:
+    if rank <= 5:
+        return "deep_top_5"
+    if rank <= TOP_N_CONTRIBUTORS:
+        return "top_10"
+    if rank <= 25:
+        return "top_25"
+    if rank <= 100:
+        return "mid_tier"
+    return "long_tail"
+
+
+def review_quota_for_rank(rank: int, merged_pr_count: int) -> int:
+    if rank <= 5:
+        quota = DEEP_REVIEW_COUNT
+    elif rank <= TOP_N_CONTRIBUTORS:
+        quota = STANDARD_REVIEW_COUNT
+    elif rank <= 25:
+        quota = NEXT_TIER_REVIEW_COUNT
+    elif rank <= 100:
+        quota = MID_TIER_REVIEW_COUNT
+    else:
+        quota = LONG_TAIL_REVIEW_COUNT
+    return max(1, min(quota, merged_pr_count))
 
 
 def selected_prs_for_contributor(prs: list[dict[str, Any]], contributor: str, quota: int) -> list[dict[str, Any]]:
@@ -995,6 +1026,45 @@ def score_review_interaction(bundle: dict[str, Any], contributor: str) -> dict[s
     }
 
 
+def review_interactions_from_selected_bundles(
+    bundles: dict[int, dict[str, Any]],
+    contributor_handles: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    contributor_set = set(contributor_handles)
+    interactions_by_contributor: dict[str, list[dict[str, Any]]] = {handle: [] for handle in contributor_handles}
+    seen: set[tuple[str, int]] = set()
+    for bundle in bundles.values():
+        detail = bundle["detail"]
+        author = detail.get("user", {}).get("login")
+        reviewers = set()
+        for review in bundle.get("reviews", []):
+            login = review.get("user", {}).get("login")
+            if login:
+                reviewers.add(login)
+        for comment in bundle.get("review_comments", []):
+            login = comment.get("user", {}).get("login")
+            if login:
+                reviewers.add(login)
+        for reviewer in reviewers & contributor_set:
+            if reviewer == author or (reviewer, detail["number"]) in seen:
+                continue
+            scored = score_review_interaction(bundle, reviewer)
+            if scored:
+                interactions_by_contributor[reviewer].append(scored)
+                seen.add((reviewer, detail["number"]))
+    for contributor, interactions in interactions_by_contributor.items():
+        interactions.sort(
+            key=lambda item: (
+                item["review_quality_score"],
+                item["substantive"],
+                item["pr_number"],
+            ),
+            reverse=True,
+        )
+        interactions_by_contributor[contributor] = interactions[:5]
+    return interactions_by_contributor
+
+
 def capped_weighted_average(values: list[tuple[float, float]]) -> float:
     if not values:
         return 0.0
@@ -1210,24 +1280,36 @@ def build_sources(pr_reviews: list[dict[str, Any]], bundles: dict[int, dict[str,
 
 
 def write_checkpoint(
-    top_contributors: list[dict[str, Any]],
+    ranked_contributors: list[dict[str, Any]],
     selected_by_contributor: dict[str, list[int]],
     pr_reviews: list[dict[str, Any]],
     contributor_scores: list[dict[str, Any]],
 ) -> None:
     score_values = [review["pr_quality_score"] for review in pr_reviews]
-    contributors_lines = []
     by_contributor_reviews = defaultdict(list)
     for review in pr_reviews:
         by_contributor_reviews[review["contributor"]].append(review)
     score_by_contributor = {row["contributor"]: row for row in contributor_scores}
-    for rank, row in enumerate(top_contributors, start=1):
+    tiers = Counter(row["coverage_tier"] for row in contributor_scores)
+    confidence_counts = Counter(row["confidence"] for row in contributor_scores)
+
+    contributor_names = [row["contributor"] for row in ranked_contributors]
+    contributor_lines = []
+    for chunk_start in range(0, len(contributor_names), 12):
+        contributor_lines.append(", ".join(f"`{name}`" for name in contributor_names[chunk_start : chunk_start + 12]))
+
+    table_rows = []
+    for rank, row in enumerate(ranked_contributors[:50], start=1):
         contributor = row["contributor"]
         reviews = by_contributor_reviews[contributor]
         score = score_by_contributor[contributor]
-        pr_list = ", ".join(f"#{review['pr_number']} ({review['work_type']}, {review['pr_quality_score']})" for review in reviews)
-        contributors_lines.append(
-            f"| {rank} | `{contributor}` | {row['provisional_impact_total']} | {len(reviews)} | "
+        pr_list = ", ".join(
+            f"#{review['pr_number']} ({review['work_type']}, {review['pr_quality_score']})"
+            for review in reviews[:8]
+        )
+        table_rows.append(
+            f"| {rank} | `{contributor}` | {row['provisional_impact_total']} | "
+            f"{row['recent_merged_pr_count']} | {score['coverage_tier']} | {len(reviews)} | "
             f"{score['quality_score']} | {score['confidence']} | {pr_list} |"
         )
 
@@ -1242,6 +1324,11 @@ def write_checkpoint(
         "60-69.9": sum(1 for value in score_values if 60 <= value < 70),
         "<60": sum(1 for value in score_values if value < 60),
     }
+    reviewed_pr_counts = Counter(len(reviews) for reviews in by_contributor_reviews.values())
+    full_table_note = (
+        f"The table below shows the first 50 contributors by reconstructed impact rank; "
+        f"all {len(ranked_contributors)} contributors are present in `data/contributor_quality_scores.json`."
+    )
     content = f"""# Part 1 Analysis Checkpoint
 
 Generated: {dt.datetime.now(dt.timezone.utc).isoformat()}
@@ -1254,12 +1341,31 @@ Part 1 is complete and ready for visualization. No dashboard UI files were creat
 
 - Source repository analyzed: `{REPO}`.
 - Current window used for the reconstructed impact cohort: merged PRs from `{START_DATE.isoformat()}` through `{END_DATE.isoformat()}`.
-- Cached GitHub input: `data/github_cache/recent_merged_prs_search_30d.json` plus per-PR bundles in `data/github_cache/raw_prs/`.
-- Important limitation: the attached assessment repository contained only `README.md`, not the prior dashboard or existing pipeline output. To satisfy the checkpoint, I reconstructed the current top contributors with a deterministic impact proxy using merged PR recency, title/body/label signal, review discussion count, high-leverage keywords, and then recalculated selected PR impact points after fetching file/review evidence.
+- Contributor coverage: all {len(ranked_contributors)} non-bot contributors with merged PRs in the cohort.
+- Reviewed PR coverage: {len(pr_reviews)} representative PR assessments.
+- Cached GitHub input: `data/github_cache/merged_prs_search_{START_DATE.isoformat()}_{END_DATE.isoformat()}.json` plus per-PR bundles in `data/github_cache/raw_prs/`.
+- Important limitation: the attached assessment repository did not include the prior dashboard or original pipeline output. I reconstructed impact rank with a deterministic impact proxy using merged PR recency, title/body/label signal, review discussion count, high-leverage keywords, and recalculated selected PR impact points after fetching file/review evidence.
 
-| Impact rank | Contributor | Reconstructed impact total | Reviewed PRs | Quality score | Confidence | Reviewed PR numbers |
-|---:|---|---:|---:|---:|---|---|
-{chr(10).join(contributors_lines)}
+## Coverage tiers
+
+- `deep_top_5`: 8 PRs per contributor, count {tiers.get('deep_top_5', 0)}.
+- `top_10`: 5 PRs per contributor, count {tiers.get('top_10', 0)}.
+- `top_25`: 4 PRs per contributor, count {tiers.get('top_25', 0)}.
+- `mid_tier`: up to 2 PRs per contributor, count {tiers.get('mid_tier', 0)}.
+- `long_tail`: 1 PR per contributor, count {tiers.get('long_tail', 0)}.
+
+Reviewed PR count distribution by contributor: {dict(sorted(reviewed_pr_counts.items()))}.
+Contributor confidence distribution: {dict(confidence_counts)}.
+
+## Contributors analyzed
+
+{chr(10).join(contributor_lines)}
+
+{full_table_note}
+
+| Impact rank | Contributor | Reconstructed impact total | Merged PRs | Coverage tier | Reviewed PRs | Quality score | Confidence | Reviewed PR examples |
+|---:|---|---:|---:|---|---:|---:|---|---|
+{chr(10).join(table_rows)}
 
 ## Rubric used
 
@@ -1293,6 +1399,7 @@ Contributor quality scores use the requested weighting:
 ## Major uncertainties
 
 - The original mechanical impact model was unavailable in this repository, so `existing_impact_points` and impact ranks are reconstructed rather than imported.
+- Long-tail contributors are intentionally lower-confidence because many only have one or two representative PRs available in the cohort.
 - GitHub public API data shows public PR discussions, file patches, labels, and linked issues; it does not capture private Slack/design discussion, internal incident context, production outcomes, or reviewer intent not written on GitHub.
 - Some high-volume data-warehouse scaffold PRs are real merged work but repetitive; their mechanical impact can overstate novelty even when the implementation follows a useful pattern.
 - Approval-only reviews are scored conservatively because they provide weaker evidence than inline design/risk discussion.
@@ -1300,8 +1407,8 @@ Contributor quality scores use the requested weighting:
 
 ## API/data limitations
 
-- GitHub search is capped, so the 30-day cohort was fetched by day (`merged:YYYY-MM-DD`) to avoid the 1,000-result search ceiling.
-- Review examples use `reviewed-by:` search plus visible review/review-comment bodies; private or deleted comments are not visible.
+- GitHub search is capped, so the cohort was fetched by day (`merged:YYYY-MM-DD`) to avoid the 1,000-result search ceiling.
+- Review leverage examples are derived from visible review events/comments on the selected PR bundles; private or deleted comments are not visible.
 - Linked issue fetching is limited to explicit `fixes/closes/resolves` references and direct `github.com/PostHog/posthog/issues/...` links found in PR text/comments.
 - Per-PR file evidence uses the GitHub Pull Request Files API, capped by pagination into cached bundles.
 
@@ -1309,7 +1416,7 @@ Contributor quality scores use the requested weighting:
 
 Ready for Part 2 visualization: yes.
 
-The required files are present:
+The required files are present and now cover every contributor in the cohort:
 
 - `data/qualitative_pr_reviews.json`
 - `data/contributor_quality_scores.json`
@@ -1333,11 +1440,11 @@ def main() -> None:
     ensure_dirs()
     client = GitHubClient()
     recent_prs = fetch_recent_merged_prs(client)
-    top_contributors = select_top_contributors(recent_prs)
+    ranked_contributors = select_top_contributors(recent_prs)
 
     selected_by_contributor: dict[str, list[dict[str, Any]]] = {}
-    for rank, row in enumerate(top_contributors, start=1):
-        quota = DEEP_REVIEW_COUNT if rank <= 5 else STANDARD_REVIEW_COUNT
+    for rank, row in enumerate(ranked_contributors, start=1):
+        quota = review_quota_for_rank(rank, row["recent_merged_pr_count"])
         selected_by_contributor[row["contributor"]] = selected_prs_for_contributor(
             recent_prs, row["contributor"], quota
         )
@@ -1359,18 +1466,28 @@ def main() -> None:
     for contributor, selected in selected_by_contributor.items():
         for pr in selected:
             pr_reviews.append(score_pr(bundles[pr["number"]], contributor, ownership_areas_by_contributor[contributor]))
-    pr_reviews.sort(key=lambda row: (top_contributors.index(next(c for c in top_contributors if c["contributor"] == row["contributor"])), -row["existing_impact_points"], row["pr_number"]))
+    rank_by_contributor = {row["contributor"]: rank for rank, row in enumerate(ranked_contributors, start=1)}
+    pr_reviews.sort(key=lambda row: (rank_by_contributor[row["contributor"]], -row["existing_impact_points"], row["pr_number"]))
 
-    review_interactions_by_contributor: dict[str, list[dict[str, Any]]] = {}
-    for row in top_contributors:
-        contributor = row["contributor"]
-        review_interactions_by_contributor[contributor] = fetch_review_interactions(client, contributor)
+    review_interactions_by_contributor = review_interactions_from_selected_bundles(
+        bundles,
+        [row["contributor"] for row in ranked_contributors],
+    )
 
     contributor_scores = []
-    for row in top_contributors:
+    for rank, row in enumerate(ranked_contributors, start=1):
         contributor = row["contributor"]
         reviews = [review for review in pr_reviews if review["contributor"] == contributor]
-        contributor_scores.append(aggregate_contributor(contributor, reviews, review_interactions_by_contributor[contributor]))
+        contributor_score = aggregate_contributor(contributor, reviews, review_interactions_by_contributor[contributor])
+        contributor_score.update(
+            {
+                "impact_rank": rank,
+                "coverage_tier": coverage_tier_for_rank(rank),
+                "recent_merged_pr_count": row["recent_merged_pr_count"],
+                "provisional_impact_total": row["provisional_impact_total"],
+            }
+        )
+        contributor_scores.append(contributor_score)
 
     sources = build_sources(pr_reviews, bundles, review_interactions_by_contributor)
 
@@ -1381,10 +1498,19 @@ def main() -> None:
     (DATA_DIR / "quality_assessment_sources.json").write_text(json.dumps(sources, indent=2, sort_keys=True))
     selected_numbers = {c: [pr["number"] for pr in prs] for c, prs in selected_by_contributor.items()}
     (CACHE_DIR / "selected_prs_by_contributor.json").write_text(json.dumps(selected_numbers, indent=2, sort_keys=True))
-    (CACHE_DIR / "top_contributors_reconstructed.json").write_text(json.dumps(top_contributors, indent=2, sort_keys=True))
-    write_checkpoint(top_contributors, selected_numbers, pr_reviews, contributor_scores)
+    (CACHE_DIR / "top_contributors_reconstructed.json").write_text(json.dumps(ranked_contributors, indent=2, sort_keys=True))
+    write_checkpoint(ranked_contributors, selected_numbers, pr_reviews, contributor_scores)
 
-    print(json.dumps({"contributors": [row["contributor"] for row in top_contributors], "reviewed_prs": len(pr_reviews)}, indent=2))
+    print(
+        json.dumps(
+            {
+                "contributors": len(ranked_contributors),
+                "top_contributors": [row["contributor"] for row in ranked_contributors[:10]],
+                "reviewed_prs": len(pr_reviews),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
